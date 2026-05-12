@@ -1,81 +1,77 @@
-# Prompt Preparation Document
-## aiokafka — PR #115: Fix Serialization for Batch API
+# Prompt Preparation — aiokafka PR #115: Fix Serialization for the Batch API
 
 ---
 
-## 3.1.1 Repository Context
+## What is aiokafka?
 
-**aiokafka** is an asynchronous Python client library for Apache Kafka built on top of `asyncio`. It provides non-blocking, coroutine-based interfaces for producing and consuming messages to and from Kafka brokers.
+aiokafka is an async Python client for Apache Kafka. It wraps Kafka's networking in Python's `asyncio` so your application never has to block the event loop waiting on a broker. If you've ever tried integrating Kafka with an async Python service the naive way — threads, blocking calls, the whole mess — you'll immediately understand why this library exists.
 
-**Intended users** are Python developers building high-throughput, event-driven applications, microservices, or data pipelines where Kafka is the messaging backbone and performance/non-blocking I/O are critical requirements. Users are typically comfortable with `asyncio` and familiar with Kafka concepts (topics, partitions, consumer groups, offsets).
+The people who use it are Python developers building event-driven systems, microservices, or data pipelines on top of Kafka. They're already comfortable with `asyncio` and they know their way around Kafka concepts like partitions, consumer groups, and offsets. For them, aiokafka handles all the plumbing: connection management, partition leader tracking, group coordination, producer batching, serialization, and transactional semantics — all without blocking.
 
-**Problem domain:** The library addresses the challenge of integrating Apache Kafka — inherently a networked, I/O-bound system — with Python's `asyncio` event loop. Without this library, developers would either block the event loop waiting on Kafka network calls, or resort to thread pools. aiokafka handles connection management, partition leadership tracking, consumer group coordination, producer batching, message serialization/deserialization, and transactional semantics — all asynchronously.
+The codebase is organized roughly like this:
 
-The repository includes:
-- [`aiokafka/producer/`](aiokafka/producer/) — `AIOKafkaProducer` with batching, transactions, and the `BatchBuilder` public API
-- [`aiokafka/consumer/`](aiokafka/consumer/) — `AIOKafkaConsumer` with group coordination and offset management
-- [`aiokafka/admin/`](aiokafka/admin/) — `AIOKafkaAdminClient` for topic/partition administration
-- [`aiokafka/record/`](aiokafka/record/) — Low-level Kafka record format encoding (legacy v0/v1, and default v2)
-- [`tests/`](tests/) — Integration and unit tests requiring a live Kafka broker
+- `aiokafka/producer/` — the `AIOKafkaProducer`, including batching, transactions, and the public `BatchBuilder` API
+- `aiokafka/consumer/` — the `AIOKafkaConsumer` with group coordination and offset tracking
+- `aiokafka/admin/` — admin tools for managing topics and partitions
+- `aiokafka/record/` — low-level record format encoding (both the legacy v0/v1 format and the current v2)
+- `tests/` — integration and unit tests that need a live Kafka broker to run
 
-**Kafka versions supported** range from 0.8.x through current, with the API version negotiated at runtime. Python 3.8+ is required.
-
----
-
-## 3.1.2 Pull Request Description
-
-**PR #115** fixes a bug reported in **issue #886**: when a producer is configured with `key_serializer` and/or `value_serializer`, those serializers are **not applied** when using the batch API (`create_batch()` + `send_batch()`), even though they are correctly applied when using the regular `send()` API.
-
-**Previous behavior:** `AIOKafkaProducer.create_batch()` called `self._message_accumulator.create_builder()` with **no arguments**, meaning the `BatchBuilder` was constructed without `key_serializer` or `value_serializer`. When a user called `batch.append(key="my_key", value={"data": 1})`, the raw Python objects were passed directly to the record builder, causing either a `TypeError` (bytes required) or silently storing unserialised values.
-
-**New behavior:** `AIOKafkaProducer.create_batch()` now passes `key_serializer=self._key_serializer` and `value_serializer=self._value_serializer` to `create_builder()`. The `BatchBuilder` class, which already holds `_key_serializer` and `_value_serializer` attributes and has a working `_serialize()` method at lines 51–61 of [`aiokafka/producer/message_accumulator.py`](aiokafka/producer/message_accumulator.py), then correctly applies those serializers inside its `append()` method before passing bytes to the underlying record builder.
-
-The fix makes the batch API and the `send()` API consistent: a producer configured with serializers will serialize messages regardless of which send path is used. A new integration test `test_producer_send_batch_with_serializer` (in [`tests/test_producer.py`](tests/test_producer.py) at line 390) validates this end-to-end against a live Kafka broker.
-
-**Files changed:**
-- [`aiokafka/producer/producer.py`](aiokafka/producer/producer.py) — line ~557: pass serializers to `create_builder()`
-- [`tests/test_producer.py`](tests/test_producer.py) — new integration test at line 390
+Supported Kafka versions go all the way back to 0.8.x, with the API version negotiated at runtime. Python 3.8+ is required.
 
 ---
 
-## 3.1.3 Acceptance Criteria
+## What's the bug, and what does this PR fix?
 
-✓ **When** a producer is configured with a `key_serializer` and `value_serializer`, **the system should** apply both serializers to keys and values appended via `batch.append()`, producing the same bytes that `producer.send()` would produce for the same inputs.
+This PR fixes **issue #886**: when you configure a producer with a `key_serializer` and/or `value_serializer`, those serializers are silently ignored if you use the batch API (`create_batch()` + `send_batch()`). They work fine with the regular `send()` API — just not with batches.
 
-✓ **When** `producer.create_batch()` is called on a producer that has a `key_serializer` configured, **the returned `BatchBuilder` instance should** have a non-`None` `_key_serializer` attribute equal to the producer's `_key_serializer`.
+**What was happening before:** `create_batch()` called `self._message_accumulator.create_builder()` with no arguments. That meant the `BatchBuilder` was created with no knowledge of any serializers. So when you called `batch.append(key="my_key", value={"data": 1})`, your raw Python objects got passed straight to the record builder — which either blew up with a `TypeError` (it expected bytes) or, worse, silently stored the unserialized data.
 
-✓ **When** `producer.create_batch()` is called on a producer with **no serializers configured** (default `None`), **the system should** produce a `BatchBuilder` with `key_serializer=None` and `value_serializer=None`, preserving backwards compatibility — raw `bytes` inputs must still work exactly as before.
+**What happens now:** `create_batch()` now passes `key_serializer=self._key_serializer` and `value_serializer=self._value_serializer` along to `create_builder()`. The `BatchBuilder` already had the plumbing for this — `_key_serializer`, `_value_serializer`, and a working `_serialize()` method (lines 51–61 of `message_accumulator.py`). It just wasn't being wired up from `create_batch()`. Now it is.
 
-✓ **When** a batch built with serialization is submitted via `send_batch()` and consumed by an `AIOKafkaConsumer`, **the consumer should** receive messages where `msg.key` and `msg.value` are the serialized byte representations (e.g., `b"KEY1"` for a key serializer that upper-cases and encodes, and `b'{"value":111}'` for a JSON value serializer).
+The end result: the batch API and `send()` are now consistent. A producer configured with serializers will serialize your messages no matter which send path you use.
 
-✓ **When** only `key_serializer` is configured (and `value_serializer` is `None`), **the implementation should** serialize only the key while leaving the value as raw bytes — and vice versa for `value_serializer` only — matching the partial-serialization behaviour of `producer.send()`.
+A new integration test — `test_producer_send_batch_with_serializer` in `tests/test_producer.py` at line 390 — validates this end-to-end against a live broker.
 
-✓ **When** `batch.append()` is called with a `None` key or `None` value, **the system should** not call the serializer on the `None` value and should pass `None` directly to the record builder, consistent with the existing behaviour in `BatchBuilder._serialize()` lines 52–60.
-
-✓ **The implementation should** pass the existing test suite in [`tests/test_message_accumulator.py`](tests/test_message_accumulator.py) without modification, confirming that internal `create_builder()` calls (which pass no serializer arguments) still produce valid `BatchBuilder` instances with `None` serializers.
-
----
-
-## 3.1.4 Edge Cases
-
-**Edge Case 1 — Serializer returns `None`**
-If a user supplies a `value_serializer` that returns `None` for a given input (e.g., a serializer that filters messages), the `BatchBuilder._serialize()` path must not raise a `TypeError`. The record builder already handles `None` values (tombstone/delete semantics in compacted topics), so the serializer result of `None` must be passed through cleanly. Verify that `batch.append(key=b"k", value=some_value_that_serializes_to_None)` produces a valid metadata result rather than crashing.
-
-**Edge Case 2 — Serializer raises an exception**
-If `key_serializer` or `value_serializer` raises during `batch.append()` (e.g., a JSON serializer given a non-serializable object), the exception must propagate synchronously out of `batch.append()` to the caller. Because `BatchBuilder.append()` is not a coroutine, there is no `asyncio` error handling layer here — the exception must bubble up directly. Ensure no batch state corruption occurs (e.g., `_relative_offset` should not have been incremented before the error).
-
-**Edge Case 3 — Mixed usage: batch API alongside `send()` in the same producer session**
-A producer configured with serializers may use both `producer.send(topic, key="k", value={"a":1})` and `batch = producer.create_batch(); batch.append(key="k", value={"a":1}); producer.send_batch(batch, topic, partition=0)` in the same session. Both paths must produce byte-identical messages on the broker. Any regression where one path serializes and the other does not would silently produce corrupt data that is difficult to debug downstream.
-
-**Edge Case 4 — Transactional producer with batch API**
-When `transactional_id` is configured, `create_builder()` sets `is_transactional=True` and uses the `DefaultRecordBatchBuilder` (magic=2). The fix must not disturb this: both `is_transactional` and serializers must be correctly forwarded to `BatchBuilder`. Verify that a transactional producer can build a serialized batch and commit it in a transaction without errors.
-
-**Edge Case 5 — Explicitly closed batch submitted after serialization**
-If a user calls `batch.close()` before `send_batch()`, subsequent `batch.append()` calls must return `None` (batch is closed) regardless of whether serializers are configured. The close state check in `BatchBuilder.append()` (line 80 of `message_accumulator.py`) must short-circuit before `_serialize()` is called, avoiding unnecessary serializer invocations on a closed batch.
+**Files touched:**
+- `aiokafka/producer/producer.py` (~line 557) — the one-line fix: pass serializers to `create_builder()`
+- `tests/test_producer.py` — the new integration test at line 390
 
 ---
 
-## 3.1.5 Initial Prompt
+## What "done" looks like
+
+Here's what this fix needs to get right:
+
+- A producer configured with `key_serializer` and `value_serializer` should apply both when you call `batch.append()`. The output bytes should be identical to what `producer.send()` would have produced for the same inputs.
+- Calling `producer.create_batch()` on a serializer-configured producer should give you a `BatchBuilder` whose `_key_serializer` attribute matches the producer's — not `None`.
+- If you create a producer *without* any serializers (the default), nothing changes. Raw `bytes` inputs still work exactly as before. No regressions.
+- Partial configuration — only a `key_serializer`, or only a `value_serializer` — should work correctly, serializing just the configured side and leaving the other as-is. That's how `producer.send()` already behaves.
+- When the batch gets sent via `send_batch()` and consumed by an `AIOKafkaConsumer`, the consumer should see the serialized bytes — e.g., `b"KEY1"` for an uppercase-and-encode key serializer, `b'{"value":111}'` for a JSON value serializer.
+- `batch.append(key=None, value=None)` should not try to run `None` through a serializer. The existing `_serialize()` logic already handles this — just make sure the fix doesn't accidentally break it.
+- The existing tests in `tests/test_message_accumulator.py` must keep passing. Internal calls to `create_builder()` that don't pass serializer arguments should still produce valid `BatchBuilder` instances with `None` serializers.
+
+---
+
+## Edge cases worth thinking about
+
+**What if the serializer returns `None`?**
+Some serializers might return `None` for certain inputs — for example, a filtering serializer that drops messages it doesn't recognize. That `None` needs to pass through to the record builder cleanly. Kafka's record format already handles `None` values (they're tombstones in compacted topics), so this shouldn't crash — but it's worth verifying that `batch.append(key=b"k", value=something_that_serializes_to_None)` produces a valid metadata result rather than a `TypeError`.
+
+**What if the serializer throws?**
+If your `key_serializer` or `value_serializer` raises an exception (say, you passed a non-JSON-serializable object to a JSON serializer), that exception should propagate straight out of `batch.append()` to the caller. There's no `asyncio` exception-handling layer here — `append()` is synchronous — so the error will just bubble up directly. The important thing is that the batch's internal `_relative_offset` counter shouldn't have been incremented yet when the error happens. No corrupted state.
+
+**Mixing the batch API with `send()` in the same session**
+It's perfectly valid for code to use both paths on the same producer — sometimes calling `producer.send()`, other times building a batch manually. With serializers configured, both paths now serialize consistently. Before this fix, mixing the two would silently produce inconsistent data on the broker. That was hard to debug and easy to miss.
+
+**Transactional producers**
+When `transactional_id` is set, `create_builder()` sets `is_transactional=True` and uses the `DefaultRecordBatchBuilder` (magic=2). The serializer fix must not interfere with this. Both `is_transactional` and the serializer arguments need to be forwarded correctly to `BatchBuilder`. A transactional producer building a serialized batch and committing it in a transaction should work without issues.
+
+**Appending to a closed batch**
+If someone calls `batch.close()` and then tries to `batch.append()` anyway, the return value should be `None` (the batch is closed, nothing was added). This should happen *before* `_serialize()` is ever called — the close-state check at line 80 of `message_accumulator.py` already short-circuits early. Just confirm the fix doesn't accidentally move that check somewhere it no longer fires first.
+
+---
+
+## The prompt
 
 ```
 You are implementing a bug fix for the aiokafka library, an asyncio-based 
